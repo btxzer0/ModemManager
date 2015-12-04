@@ -35,16 +35,19 @@
 #include "mm-bearer-list.h"
 #include "mm-iface-modem.h"
 #include "mm-iface-modem-3gpp.h"
+#include "mm-iface-modem-3gpp-ussd.h"
 #include "mm-iface-modem-messaging.h"
 #include "mm-sms-part-3gpp.h"
 
 static void iface_modem_init (MMIfaceModem *iface);
 static void iface_modem_3gpp_init (MMIfaceModem3gpp *iface);
+static void iface_modem_3gpp_ussd_init (MMIfaceModem3gppUssd *iface);
 static void iface_modem_messaging_init (MMIfaceModemMessaging *iface);
 
 G_DEFINE_TYPE_EXTENDED (MMBroadbandModemMbim, mm_broadband_modem_mbim, MM_TYPE_BROADBAND_MODEM, 0,
                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init)
                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_3GPP, iface_modem_3gpp_init)
+                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_3GPP_USSD, iface_modem_3gpp_ussd_init)
                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_MESSAGING, iface_modem_messaging_init))
 
 typedef enum {
@@ -55,6 +58,7 @@ typedef enum {
     PROCESS_NOTIFICATION_FLAG_CONNECT              = 1 << 3,
     PROCESS_NOTIFICATION_FLAG_SUBSCRIBER_INFO      = 1 << 4,
     PROCESS_NOTIFICATION_FLAG_PACKET_SERVICE       = 1 << 5,
+    PROCESS_NOTIFICATION_FLAG_USSD                 = 1 << 6,
 } ProcessNotificationFlag;
 
 struct _MMBroadbandModemMbimPrivate {
@@ -74,6 +78,9 @@ struct _MMBroadbandModemMbimPrivate {
     /* 3GPP registration helpers */
     gchar *current_operator_id;
     gchar *current_operator_name;
+
+    /* 3GPP USSD helpers */
+    GSimpleAsyncResult *pending_ussd_action;
 
     /* Access technology updates */
     MbimDataClass available_data_classes;
@@ -1920,6 +1927,25 @@ sms_notification (MMBroadbandModemMbim *self,
     }
 }
 
+static void process_ussd_notification (MMBroadbandModemMbim *self,
+                                       MbimMessage *notification);
+
+static void
+ussd_notification (MMBroadbandModemMbim *self,
+                   MbimMessage *notification)
+{
+    switch (mbim_message_indicate_status_get_cid (notification)) {
+    case MBIM_CID_USSD:
+        if (self->priv->setup_flags & PROCESS_NOTIFICATION_FLAG_USSD)
+            process_ussd_notification (self, notification);
+        break;
+
+    default:
+        /* Ignore */
+        break;
+    }
+}
+
 static void
 device_notification_cb (MbimDevice *device,
                         MbimMessage *notification,
@@ -1939,6 +1965,9 @@ device_notification_cb (MbimDevice *device,
         break;
     case MBIM_SERVICE_SMS:
         sms_notification (self, notification);
+        break;
+    case MBIM_SERVICE_USSD:
+        ussd_notification (self, notification);
         break;
     default:
         /* Ignore */
@@ -2110,13 +2139,14 @@ common_enable_disable_unsolicited_events (MMBroadbandModemMbim *self,
                                         user_data,
                                         common_enable_disable_unsolicited_events);
 
-    mm_dbg ("Enabled notifications: signal (%s), registration (%s), sms (%s), connect (%s), subscriber (%s), packet (%s)",
+    mm_dbg ("Enabled notifications: signal (%s), registration (%s), sms (%s), connect (%s), subscriber (%s), packet (%s), ussd (%s)",
             self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_SIGNAL_QUALITY ? "yes" : "no",
             self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_REGISTRATION_UPDATES ? "yes" : "no",
             self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_SMS_READ ? "yes" : "no",
             self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_CONNECT ? "yes" : "no",
             self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_SUBSCRIBER_INFO ? "yes" : "no",
-            self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_PACKET_SERVICE ? "yes" : "no");
+            self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_PACKET_SERVICE ? "yes" : "no",
+            self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_USSD ? "yes" : "no");
 
     entries = g_new0 (MbimEventEntry *, 3);
 
@@ -2151,6 +2181,16 @@ common_enable_disable_unsolicited_events (MMBroadbandModemMbim *self,
         entries[n_entries]->cids = g_new0 (guint32, 2);
         entries[n_entries]->cids[0] = MBIM_CID_SMS_READ;
         entries[n_entries]->cids[1] = MBIM_CID_SMS_MESSAGE_STORE_STATUS;
+        n_entries++;
+    }
+
+    /* USSD service */
+    if (self->priv->enable_flags & PROCESS_NOTIFICATION_FLAG_USSD) {
+        entries[n_entries] = g_new (MbimEventEntry, 1);
+        memcpy (&(entries[n_entries]->device_service_id), MBIM_UUID_USSD, sizeof (MbimUuid));
+        entries[n_entries]->cids_count = 1;
+        entries[n_entries]->cids = g_new0 (guint32, 1);
+        entries[n_entries]->cids[0] = MBIM_CID_USSD;
         n_entries++;
     }
 
@@ -2830,6 +2870,504 @@ messaging_create_sms (MMIfaceModemMessaging *self)
 }
 
 /*****************************************************************************/
+/* Common USSD operations (3GPP/USSD interface) */
+
+static gchar *
+decode_ussd_response (MMBroadbandModemMbim *self,
+                      guint32 data_coding_scheme,
+                      guint32 payload_size,
+                      const guint8 *payload,
+                      GError **error)
+{
+    return NULL;
+}
+
+static guint8 *
+encode_ussd_request (MMBroadbandModemMbim *self,
+                     const gchar *command,
+                     guint32 *data_coding_scheme,
+                     guint32 *payload_size,
+                     GError **error)
+{
+    return NULL;
+}
+
+static void
+common_process_ussd_message (MMBroadbandModemMbim *self,
+                             MbimUssdResponse response,
+                             MbimUssdSessionState session_state,
+                             guint32 data_coding_scheme,
+                             guint32 payload_size,
+                             const guint8 *payload)
+{
+    MMModem3gppUssdSessionState ussd_state = MM_MODEM_3GPP_USSD_SESSION_STATE_IDLE;
+
+    mm_dbg ("  response: %s", mbim_ussd_response_get_string (response));
+    mm_dbg ("  session state: %s", mbim_ussd_session_state_get_string (session_state));
+    mm_dbg ("  coding scheme: %u", data_coding_scheme);
+    mm_dbg ("  payload size: %u", payload_size);
+
+    switch (response) {
+    case MBIM_USSD_RESPONSE_ACTION_REQUIRED: {
+        gchar *converted;
+        GError *error = NULL;
+
+        ussd_state = MM_MODEM_3GPP_USSD_SESSION_STATE_USER_RESPONSE;
+        converted = decode_ussd_response (self, data_coding_scheme, payload_size, payload, &error);
+
+        if (self->priv->pending_ussd_action) {
+            if (error)
+                g_simple_async_result_take_error (self->priv->pending_ussd_action, error);
+            else
+                g_simple_async_result_set_op_res_gpointer (self->priv->pending_ussd_action,
+                                                           converted,
+                                                           g_free);
+        } else {
+            if (error) {
+                mm_warn ("Invalid network initiated USSD request: %s",
+                         error->message);
+                g_error_free (error);
+            } else {
+                /* Network-initiated USSD-Request */
+                mm_iface_modem_3gpp_ussd_update_network_request (
+                    MM_IFACE_MODEM_3GPP_USSD (self),
+                    converted);
+                g_free (converted);
+            }
+        }
+        break;
+    }
+
+    case MBIM_USSD_RESPONSE_NO_ACTION_REQUIRED: {
+        gchar *converted;
+        GError *error = NULL;
+
+        converted = decode_ussd_response (self, data_coding_scheme, payload_size, payload, &error);
+        if (self->priv->pending_ussd_action) {
+            /* Response to the user's request */
+            if (error)
+                g_simple_async_result_take_error (self->priv->pending_ussd_action, error);
+            else
+                g_simple_async_result_set_op_res_gpointer (self->priv->pending_ussd_action,
+                                                           converted,
+                                                           g_free);
+        } else {
+            if (error) {
+                mm_warn ("Invalid network initiated USSD notification: %s",
+                         error->message);
+                g_error_free (error);
+            } else {
+                /* Network-initiated USSD-Notify */
+                mm_iface_modem_3gpp_ussd_update_network_notification (
+                    MM_IFACE_MODEM_3GPP_USSD (self),
+                    converted);
+                g_free (converted);
+            }
+        }
+        break;
+    }
+
+    case MBIM_USSD_RESPONSE_TERMINATED_BY_NETWORK:
+        if (self->priv->pending_ussd_action)
+            g_simple_async_result_set_error (self->priv->pending_ussd_action,
+                                             MM_CORE_ERROR,
+                                             MM_CORE_ERROR_CANCELLED,
+                                             "USSD terminated by network");
+        break;
+
+    case MBIM_USSD_RESPONSE_OTHER_LOCAL_CLIENT:
+        if (self->priv->pending_ussd_action)
+            g_simple_async_result_set_error (self->priv->pending_ussd_action,
+                                             MM_CORE_ERROR,
+                                             MM_CORE_ERROR_FAILED,
+                                             "USSD local client error");
+        break;
+
+    case MBIM_USSD_RESPONSE_OPERATION_NOT_SUPPORTED:
+        if (self->priv->pending_ussd_action)
+            g_simple_async_result_set_error (self->priv->pending_ussd_action,
+                                             MM_CORE_ERROR,
+                                             MM_CORE_ERROR_UNSUPPORTED,
+                                             "Operation not supported");
+        break;
+    case MBIM_USSD_RESPONSE_NETWORK_TIMEOUT:
+        if (self->priv->pending_ussd_action)
+            g_simple_async_result_set_error (self->priv->pending_ussd_action,
+                                             MM_CORE_ERROR,
+                                             MM_CORE_ERROR_FAILED,
+                                             "USSD response timed out");
+        break;
+    }
+
+    /* Complete the pending action */
+    if (self->priv->pending_ussd_action) {
+        g_simple_async_result_complete_in_idle (self->priv->pending_ussd_action);
+        g_object_unref (self->priv->pending_ussd_action);
+        self->priv->pending_ussd_action = NULL;
+    }
+}
+
+/*****************************************************************************/
+/* Process USSD notification (3GPP/USSD interface) */
+
+static void
+process_ussd_notification (MMBroadbandModemMbim *self,
+                           MbimMessage *notification)
+{
+    GError *error = NULL;
+    MbimUssdResponse response;
+    MbimUssdSessionState session_state;
+    guint32 data_coding_scheme;
+    guint32 payload_size;
+    const guint8 *payload;
+
+    mm_dbg ("Received USSD notification");
+    if (!mbim_message_ussd_notification_parse (notification,
+                                               &response,
+                                               &session_state,
+                                               &data_coding_scheme,
+                                               &payload_size,
+                                               &payload,
+                                               &error)) {
+        mm_warn ("Couldn't parse received USSD notification: %s", error->message);
+        g_error_free (error);
+        return;
+    }
+
+    common_process_ussd_message (self,
+                                 response,
+                                 session_state,
+                                 data_coding_scheme,
+                                 payload_size,
+                                 payload);
+}
+
+/*****************************************************************************/
+/* Send USSD (3GPP/USSD interface) */
+
+static const gchar *
+modem_3gpp_ussd_send_finish (MMIfaceModem3gppUssd *self,
+                             GAsyncResult *res,
+                             GError **error)
+{
+    if (g_simple_async_result_propagate_error (G_SIMPLE_ASYNC_RESULT (res), error))
+        return NULL;
+
+    /* We can return the string as constant because it is owned by the async
+     * result, which will be valid during the whole call of its callback, which
+     * is when we're actually calling finish() */
+    return (const gchar *)g_simple_async_result_get_op_res_gpointer (G_SIMPLE_ASYNC_RESULT (res));
+}
+
+static void
+ussd_send_ready (MbimDevice *device,
+                 GAsyncResult *res,
+                 MMBroadbandModemMbim *self)
+{
+    MbimMessage *message;
+    GError *error = NULL;
+    MbimUssdResponse response;
+    MbimUssdSessionState session_state;
+    guint32 data_coding_scheme;
+    guint32 payload_size;
+    const guint8 *payload;
+
+    message = mbim_device_command_finish (device, res, &error);
+    if (message &&
+        mbim_message_ussd_response_parse (message,
+                                          &response,
+                                          &session_state,
+                                          &data_coding_scheme,
+                                          &payload_size,
+                                          &payload,
+                                          &error)) {
+        mm_dbg ("Received USSD response");
+        common_process_ussd_message (self,
+                                     response,
+                                     session_state,
+                                     data_coding_scheme,
+                                     payload_size,
+                                     payload);
+    } else {
+        /* Some immediate error happened when sending the USSD request */
+        mm_dbg ("Error sending USSD request: '%s'", error->message);
+        g_error_free (error);
+        if (self->priv->pending_ussd_action) {
+            GSimpleAsyncResult *result;
+
+            result = self->priv->pending_ussd_action;
+            self->priv->pending_ussd_action = NULL;
+
+            g_simple_async_result_take_error (result, error);
+            g_simple_async_result_complete_in_idle (result);
+            g_object_unref (result);
+        } else
+            /* So the USSD action was completed already... */
+            mm_dbg ("USSD action already completed via URCs");
+    }
+
+    if (message)
+        mbim_message_unref (message);
+
+    mm_iface_modem_3gpp_ussd_update_state (MM_IFACE_MODEM_3GPP_USSD (self),
+                                           MM_MODEM_3GPP_USSD_SESSION_STATE_IDLE);
+
+    g_object_unref (self);
+}
+
+static void
+modem_3gpp_ussd_send (MMIfaceModem3gppUssd *_self,
+                      const gchar *command,
+                      GAsyncReadyCallback callback,
+                      gpointer user_data)
+{
+    MMBroadbandModemMbim *self;
+    MbimDevice *device;
+    MbimMessage *message;
+    guint32 data_coding_scheme = 0;
+    guint32 payload_size = 0;
+    guint8 *payload = NULL;
+    GError *error = NULL;
+
+    self = (MMBroadbandModemMbim *)_self;
+
+    if (!peek_device (self, &device, callback, user_data))
+        return;
+
+    /* Build payload */
+    payload = encode_ussd_request (self,
+                                   command,
+                                   &data_coding_scheme,
+                                   &payload_size,
+                                   &error);
+    if (!payload) {
+        g_simple_async_report_take_gerror_in_idle (G_OBJECT (self),
+                                                   callback,
+                                                   user_data,
+                                                   error);
+        return;
+    }
+
+    /* Cache the action, as it may be completed via URCs.
+     * There shouldn't be any previous action pending. */
+    g_warn_if_fail (self->priv->pending_ussd_action == NULL);
+    self->priv->pending_ussd_action = g_simple_async_result_new (G_OBJECT (self),
+                                                                 callback,
+                                                                 user_data,
+                                                                 modem_3gpp_ussd_send);
+
+    mm_dbg ("Sending USSD...");
+    message = mbim_message_ussd_set_new (MBIM_USSD_ACTION_INITIATE,
+                                         data_coding_scheme,
+                                         payload_size,
+                                         payload,
+                                         NULL);
+    mbim_device_command (device,
+                         message,
+                         10,
+                         NULL,
+                         (GAsyncReadyCallback) ussd_send_ready,
+                         g_object_ref (self));
+    mbim_message_unref (message);
+}
+
+/*****************************************************************************/
+/* Cancel USSD (3GPP/USSD interface) */
+
+typedef struct {
+    MMBroadbandModemMbim *self;
+    GSimpleAsyncResult *result;
+} Modem3gppUssdCancelContext;
+
+static void
+modem_3gpp_ussd_cancel_context_complete_and_free (Modem3gppUssdCancelContext *ctx)
+{
+    g_simple_async_result_complete (ctx->result);
+    g_object_unref (ctx->result);
+    g_object_unref (ctx->self);
+    g_slice_free (Modem3gppUssdCancelContext, ctx);
+}
+
+static gboolean
+modem_3gpp_ussd_cancel_finish (MMIfaceModem3gppUssd *self,
+                               GAsyncResult *res,
+                               GError **error)
+{
+    return !g_simple_async_result_propagate_error (G_SIMPLE_ASYNC_RESULT (res), error);
+}
+
+static void
+ussd_cancel_ready (MbimDevice *device,
+                   GAsyncResult *res,
+                   Modem3gppUssdCancelContext *ctx)
+{
+    MbimMessage *message;
+    GError *error = NULL;
+    MbimUssdResponse response;
+
+    message = mbim_device_command_finish (device, res, &error);
+    if (message &&
+        mbim_message_ussd_response_parse (message,
+                                          &response,
+                                          NULL, /* session_state */
+                                          NULL, /* dcs */
+                                          NULL, /* payload_size */
+                                          NULL, /* payload */
+                                          &error)) {
+        if (response == MBIM_USSD_RESPONSE_TERMINATED_BY_NETWORK ||
+            response == MBIM_USSD_RESPONSE_NO_ACTION_REQUIRED)
+            g_simple_async_result_set_op_res_gboolean (ctx->result, TRUE);
+        else
+            g_simple_async_result_set_error (ctx->result,
+                                             MM_CORE_ERROR,
+                                             MM_CORE_ERROR_FAILED,
+                                             "USSD session cancel failed: %s",
+                                             mbim_ussd_response_get_string (response));
+    }
+    else
+        g_simple_async_result_take_error (ctx->result, error);
+    modem_3gpp_ussd_cancel_context_complete_and_free (ctx);
+
+    if (message)
+        mbim_message_unref (message);
+
+    /* Complete the pending action, if any */
+    if (ctx->self->priv->pending_ussd_action) {
+        g_simple_async_result_set_error (ctx->self->priv->pending_ussd_action,
+                                         MM_CORE_ERROR,
+                                         MM_CORE_ERROR_CANCELLED,
+                                         "USSD session was cancelled");
+        g_simple_async_result_complete_in_idle (ctx->self->priv->pending_ussd_action);
+        g_object_unref (ctx->self->priv->pending_ussd_action);
+        ctx->self->priv->pending_ussd_action = NULL;
+    }
+
+    mm_iface_modem_3gpp_ussd_update_state (MM_IFACE_MODEM_3GPP_USSD (ctx->self),
+                                           MM_MODEM_3GPP_USSD_SESSION_STATE_IDLE);
+}
+
+static void
+modem_3gpp_ussd_cancel (MMIfaceModem3gppUssd *self,
+                        GAsyncReadyCallback callback,
+                        gpointer user_data)
+{
+    Modem3gppUssdCancelContext *ctx;
+    MbimDevice *device;
+    MbimMessage *message;
+
+    if (!peek_device (self, &device, callback, user_data))
+        return;
+
+    ctx = g_slice_new (Modem3gppUssdCancelContext);
+    ctx->self = g_object_ref (self);
+    ctx->result = g_simple_async_result_new (G_OBJECT (self),
+                                             callback,
+                                             user_data,
+                                             modem_3gpp_ussd_cancel);
+
+    mm_dbg ("Cancelling USSD...");
+    message = mbim_message_ussd_set_new (MBIM_USSD_ACTION_CANCEL, 0, 0, NULL, NULL);
+    mbim_device_command (device,
+                         message,
+                         10,
+                         NULL,
+                         (GAsyncReadyCallback) ussd_cancel_ready,
+                         ctx);
+    mbim_message_unref (message);
+}
+
+/*****************************************************************************/
+/* Enable/Disable unsolicited event handlers (3GPP USSD interface) */
+
+static gboolean
+common_enable_disable_unsolicited_events_ussd_finish (MMIfaceModem3gppUssd *self,
+                                                      GAsyncResult *res,
+                                                      GError **error)
+{
+    return common_enable_disable_unsolicited_events_finish (MM_BROADBAND_MODEM_MBIM (self), res, error);
+}
+
+static void
+disable_unsolicited_events_ussd (MMIfaceModem3gppUssd *self,
+                                 GAsyncReadyCallback callback,
+                                 gpointer user_data)
+{
+    MM_BROADBAND_MODEM_MBIM (self)->priv->enable_flags &= ~PROCESS_NOTIFICATION_FLAG_USSD;
+    common_enable_disable_unsolicited_events (MM_BROADBAND_MODEM_MBIM (self), callback, user_data);
+}
+
+static void
+enable_unsolicited_events_ussd (MMIfaceModem3gppUssd *self,
+                                GAsyncReadyCallback callback,
+                                gpointer user_data)
+{
+    MM_BROADBAND_MODEM_MBIM (self)->priv->enable_flags |= PROCESS_NOTIFICATION_FLAG_USSD;
+    common_enable_disable_unsolicited_events (MM_BROADBAND_MODEM_MBIM (self), callback, user_data);
+}
+
+/*****************************************************************************/
+/* Setup/cleanup unsolicited event handlers (3GPP USSD interface) */
+
+static gboolean
+common_setup_cleanup_unsolicited_events_ussd_finish (MMIfaceModem3gppUssd *self,
+                                                     GAsyncResult *res,
+                                                     GError **error)
+{
+    return common_setup_cleanup_unsolicited_events_finish (MM_BROADBAND_MODEM_MBIM (self), res, error);
+}
+
+static void
+cleanup_unsolicited_events_ussd (MMIfaceModem3gppUssd *self,
+                                 GAsyncReadyCallback callback,
+                                 gpointer user_data)
+{
+    MM_BROADBAND_MODEM_MBIM (self)->priv->setup_flags &= ~PROCESS_NOTIFICATION_FLAG_USSD;
+    common_setup_cleanup_unsolicited_events (MM_BROADBAND_MODEM_MBIM (self), FALSE, callback, user_data);
+}
+
+static void
+setup_unsolicited_events_ussd (MMIfaceModem3gppUssd *self,
+                               GAsyncReadyCallback callback,
+                               gpointer user_data)
+{
+    MM_BROADBAND_MODEM_MBIM (self)->priv->setup_flags |= PROCESS_NOTIFICATION_FLAG_USSD;
+    common_setup_cleanup_unsolicited_events (MM_BROADBAND_MODEM_MBIM (self), TRUE, callback, user_data);
+}
+
+/*****************************************************************************/
+/* Check support (3GPP USSD interface) */
+
+static gboolean
+modem_3gpp_ussd_check_support_finish (MMIfaceModem3gppUssd *self,
+                                      GAsyncResult *res,
+                                      GError **error)
+{
+    /* no error expected here */
+    return g_simple_async_result_get_op_res_gboolean (G_SIMPLE_ASYNC_RESULT (res));
+}
+
+static void
+modem_3gpp_ussd_check_support (MMIfaceModem3gppUssd *_self,
+                               GAsyncReadyCallback callback,
+                               gpointer user_data)
+{
+    MMBroadbandModemMbim *self = MM_BROADBAND_MODEM_MBIM (_self);
+    GSimpleAsyncResult *result;
+    gboolean is_3gpp;
+
+    result = g_simple_async_result_new (G_OBJECT (self),
+                                        callback,
+                                        user_data,
+                                        messaging_check_support);
+
+    /* We allow USSD in 3GPP capable modems */
+    is_3gpp = (self->priv->caps_cellular_class & MBIM_CELLULAR_CLASS_GSM);
+    g_simple_async_result_set_op_res_gboolean (result, is_3gpp);
+    g_simple_async_result_complete_in_idle (result);
+    g_object_unref (result);
+}
+
+/*****************************************************************************/
 
 MMBroadbandModemMbim *
 mm_broadband_modem_mbim_new (const gchar *device,
@@ -2965,6 +3503,28 @@ iface_modem_3gpp_init (MMIfaceModem3gpp *iface)
     iface->register_in_network_finish = modem_3gpp_register_in_network_finish;
     iface->scan_networks = modem_3gpp_scan_networks;
     iface->scan_networks_finish = modem_3gpp_scan_networks_finish;
+}
+
+static void
+iface_modem_3gpp_ussd_init (MMIfaceModem3gppUssd *iface)
+{
+    iface->check_support = modem_3gpp_ussd_check_support;
+    iface->check_support_finish = modem_3gpp_ussd_check_support_finish;
+    iface->setup_unsolicited_result_codes = setup_unsolicited_events_ussd;
+    iface->setup_unsolicited_result_codes_finish = common_setup_cleanup_unsolicited_events_ussd_finish;
+    iface->cleanup_unsolicited_result_codes = cleanup_unsolicited_events_ussd;
+    iface->cleanup_unsolicited_result_codes_finish = common_setup_cleanup_unsolicited_events_ussd_finish;
+    iface->enable_unsolicited_result_codes = enable_unsolicited_events_ussd;
+    iface->enable_unsolicited_result_codes_finish = common_enable_disable_unsolicited_events_ussd_finish;
+    iface->disable_unsolicited_result_codes = disable_unsolicited_events_ussd;
+    iface->disable_unsolicited_result_codes_finish = common_enable_disable_unsolicited_events_ussd_finish;
+    iface->send = modem_3gpp_ussd_send;
+    iface->send_finish = modem_3gpp_ussd_send_finish;
+    iface->cancel = modem_3gpp_ussd_cancel;
+    iface->cancel_finish = modem_3gpp_ussd_cancel_finish;
+
+    iface->encode = NULL;
+    iface->decode = NULL;
 }
 
 static void
