@@ -139,4 +139,12 @@ gboolean mm_huawei_parse_time_response (const gchar *response,
                                         MMNetworkTimezone **tzp,
                                         GError **error);
 
+/*****************************************************************************/
+/* ^CVOICE response parser */
+
+gboolean mm_huawei_parse_cvoice_response (const gchar *response,
+                                          guint *hz,
+                                          guint *bits,
+                                          GError **error);
+
 #endif  /* MM_MODEM_HELPERS_HUAWEI_H */

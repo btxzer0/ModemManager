@@ -128,12 +128,17 @@ struct _MMBroadbandModemHuaweiPrivate {
     FeatureSupport prefmode_support;
     FeatureSupport time_support;
     FeatureSupport nwtime_support;
+    FeatureSupport voice_support;
 
     MMModemLocationSource enabled_sources;
 
     GArray *syscfg_supported_modes;
     GArray *syscfgex_supported_modes;
     GArray *prefmode_supported_modes;
+
+    /* Voicecall audio related properties */
+    guint audio_hz;
+    guint audio_bits;
 };
 
 /*****************************************************************************/
@@ -2860,6 +2865,71 @@ get_detailed_registration_state (MMIfaceModemCdma *self,
 }
 
 /*****************************************************************************/
+/* Check if Voice supported (Voice interface) */
+
+static gboolean
+modem_voice_check_support_finish (MMIfaceModemVoice *self,
+                                  GAsyncResult *res,
+                                  GError **error)
+{
+    return !g_simple_async_result_propagate_error (G_SIMPLE_ASYNC_RESULT (res), error);
+}
+
+static void
+cvoice_check_ready (MMBroadbandModem *modem,
+                    GAsyncResult *res,
+                    GSimpleAsyncResult *simple)
+{
+    MMBroadbandModemHuawei *self = MM_BROADBAND_MODEM_HUAWEI (modem);
+    GError *error = NULL;
+    const gchar *response;
+
+    response = mm_base_modem_at_command_finish (MM_BASE_MODEM (modem), res, &error);
+    if (error) {
+        g_simple_async_result_take_error (simple, error);
+        goto done;
+    }
+
+    if (!mm_huawei_parse_cvoice_response (response,
+                                          &self->priv->audio_hz,
+                                          &self->priv->audio_bits,
+                                          &error)) {
+        self->priv->voice_support = FEATURE_NOT_SUPPORTED;
+        g_simple_async_result_take_error (simple, error);
+    } else {
+        self->priv->voice_support = FEATURE_SUPPORTED;
+        g_simple_async_result_set_op_res_gboolean (simple, TRUE);
+    }
+
+done:
+    g_simple_async_result_complete (simple);
+    g_object_unref (simple);
+}
+
+static void
+modem_voice_check_support (MMIfaceModemVoice *self,
+                           GAsyncReadyCallback callback,
+                           gpointer user_data)
+{
+    GSimpleAsyncResult *result;
+
+    result = g_simple_async_result_new (G_OBJECT (self),
+                                        callback,
+                                        user_data,
+                                        modem_voice_check_support);
+
+    /* We assume that all modems have voice capabilities, but ... */
+
+    /* Check ATH support */
+    mm_base_modem_at_command (MM_BASE_MODEM (self),
+                              "^CVOICE?",
+                              3,
+                              TRUE,
+                              (GAsyncReadyCallback)cvoice_check_ready,
+                              result);
+}
+
+/*****************************************************************************/
 /* Setup/Cleanup unsolicited events (Voice interface) */
 
 static void
@@ -4197,16 +4267,6 @@ mm_broadband_modem_huawei_init (MMBroadbandModemHuawei *self)
      */
     self->priv->cschannelinfo_regex = g_regex_new ("\\r\\n\\^CSCHANNELINFO:\\s*(\\d+),(\\d+)\\r\\n",
                                                     G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
-
-
-    self->priv->ndisdup_support = FEATURE_SUPPORT_UNKNOWN;
-    self->priv->rfswitch_support = FEATURE_SUPPORT_UNKNOWN;
-    self->priv->sysinfoex_support = FEATURE_SUPPORT_UNKNOWN;
-    self->priv->syscfg_support = FEATURE_SUPPORT_UNKNOWN;
-    self->priv->syscfgex_support = FEATURE_SUPPORT_UNKNOWN;
-    self->priv->prefmode_support = FEATURE_SUPPORT_UNKNOWN;
-    self->priv->nwtime_support = FEATURE_SUPPORT_UNKNOWN;
-    self->priv->time_support = FEATURE_SUPPORT_UNKNOWN;
 }
 
 static void
@@ -4359,6 +4419,8 @@ iface_modem_voice_init (MMIfaceModemVoice *iface)
 {
     iface_modem_voice_parent = g_type_interface_peek_parent (iface);
 
+    iface->check_support = modem_voice_check_support;
+    iface->check_support_finish = modem_voice_check_support_finish;
     iface->setup_unsolicited_events = modem_voice_setup_unsolicited_events;
     iface->setup_unsolicited_events_finish = modem_voice_setup_cleanup_unsolicited_events_finish;
     iface->cleanup_unsolicited_events = modem_voice_cleanup_unsolicited_events;

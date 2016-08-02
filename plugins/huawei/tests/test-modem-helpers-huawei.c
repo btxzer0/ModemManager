@@ -1192,6 +1192,47 @@ test_time (void)
 }
 
 /*****************************************************************************/
+/* Test ^CVOICE responses */
+
+typedef struct {
+    const gchar *str;
+    gboolean ret;
+    guint hz;
+    guint bits;
+} CvoiceTest;
+
+static const CvoiceTest cvoice_tests[] = {
+    { "^CVOICE:0,8000,16,20", TRUE, 8000, 16 },
+    { "^CVOICE: 1, 8000, 16, 20", FALSE, 0, 0 },
+    { "^CVOICE:1", FALSE, 0, 0 },
+    { NULL, FALSE, 0, 0 }
+};
+
+static void
+test_cvoice (void)
+{
+    guint i;
+
+    for (i = 0; cvoice_tests[i].str; i++) {
+        GError *error = NULL;
+        guint hz = 0, bits = 0;
+        gboolean ret;
+
+        ret = mm_huawei_parse_cvoice_response (cvoice_tests[i].str,
+                                               &hz,
+                                               &bits,
+                                               &error);
+
+        g_assert (ret == cvoice_tests[i].ret);
+        g_assert (ret == (error ? FALSE : TRUE));
+        g_clear_error (&error);
+
+        g_assert_cmpint (cvoice_tests[i].hz, ==, hz);
+        g_assert_cmpint (cvoice_tests[i].bits, ==, bits);
+    }
+}
+
+/*****************************************************************************/
 
 void
 _mm_log (const char *loc,
@@ -1232,6 +1273,7 @@ int main (int argc, char **argv)
     g_test_add_func ("/MM/huawei/syscfgex/response", test_syscfgex_response);
     g_test_add_func ("/MM/huawei/nwtime", test_nwtime);
     g_test_add_func ("/MM/huawei/time", test_time);
+    g_test_add_func ("/MM/huawei/cvoice", test_cvoice);
 
     return g_test_run ();
 }

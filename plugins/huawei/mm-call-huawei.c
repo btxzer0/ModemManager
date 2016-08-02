@@ -50,51 +50,16 @@ call_start_context_complete_and_free (CallStartContext *ctx)
 }
 
 static void
-call_start_ready (MMBaseModem *modem,
-                  GAsyncResult *res,
-                  CallStartContext *ctx)
+call_start_audio_ready (MMBaseModem *modem,
+                        GAsyncResult *res,
+                        CallStartContext *ctx)
 {
     GError *error = NULL;
     const gchar *response = NULL;
 
     response = mm_base_modem_at_command_finish (modem, res, &error);
     if (error) {
-        if (g_error_matches (error, MM_SERIAL_ERROR, MM_SERIAL_ERROR_RESPONSE_TIMEOUT)) {
-            /* something is wrong, serial timeout could never occurs */
-        }
-
-        if (g_error_matches (error, MM_CONNECTION_ERROR, MM_CONNECTION_ERROR_NO_DIALTONE)) {
-            /* Update state */
-            mm_base_call_change_state(ctx->self, MM_CALL_STATE_TERMINATED, MM_CALL_STATE_REASON_ERROR);
-        }
-
-        if (g_error_matches (error, MM_CONNECTION_ERROR, MM_CONNECTION_ERROR_BUSY)      ||
-            g_error_matches (error, MM_CONNECTION_ERROR, MM_CONNECTION_ERROR_NO_ANSWER) ||
-            g_error_matches (error, MM_CONNECTION_ERROR, MM_CONNECTION_ERROR_NO_CARRIER)) {
-            /* Update state */
-            mm_base_call_change_state(ctx->self, MM_CALL_STATE_TERMINATED, MM_CALL_STATE_REASON_REFUSED_OR_BUSY);
-        }
-
-        mm_dbg ("Couldn't start call : '%s'", error->message);
-        g_simple_async_result_take_error (ctx->result, error);
-        call_start_context_complete_and_free (ctx);
-        return;
-    }
-
-    /* check response for error */
-    if (response && strlen (response) > 0 ) {
-        error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-                             "Couldn't start the call: "
-                             "Modem response '%s'", response);
-
-        /* Update state */
-        mm_base_call_change_state (ctx->self, MM_CALL_STATE_TERMINATED, MM_CALL_STATE_REASON_REFUSED_OR_BUSY);
-    } else {
-        /* Update state */
-        mm_base_call_change_state (ctx->self, MM_CALL_STATE_DIALING, MM_CALL_STATE_REASON_OUTGOING_STARTED);
-    }
-
-    if (error) {
+        mm_dbg ("Couldn't start call audio: '%s'", error->message);
         g_simple_async_result_take_error (ctx->result, error);
         call_start_context_complete_and_free (ctx);
         return;
@@ -105,12 +70,33 @@ call_start_ready (MMBaseModem *modem,
 }
 
 static void
+parent_call_start_ready (MMBaseCall *self,
+                         GAsyncResult *res,
+                         CallStartContext *ctx)
+{
+    GError *error = NULL;
+
+    if (!MM_BASE_CALL_CLASS (mm_call_huawei_parent_class)->start_finish (self, res, &error)) {
+        g_simple_async_result_take_error (ctx->result, error);
+        call_start_context_complete_and_free (ctx);
+        return;
+    }
+
+    /* Enable audio streaming on the audio port */
+    mm_base_modem_at_command (ctx->modem,
+                              "AT^DDSETEX=2",
+                              5,
+                              FALSE,
+                              (GAsyncReadyCallback)call_start_audio_ready,
+                              ctx);
+}
+
+static void
 call_start (MMBaseCall *self,
             GAsyncReadyCallback callback,
             gpointer user_data)
 {
     CallStartContext *ctx;
-    gchar *cmd;
 
     /* Setup the context */
     ctx = g_new0 (CallStartContext, 1);
@@ -123,14 +109,11 @@ call_start (MMBaseCall *self,
                   MM_BASE_CALL_MODEM, &ctx->modem,
                   NULL);
 
-    cmd = g_strdup_printf ("ATD%s;", mm_gdbus_call_get_number (MM_GDBUS_CALL (self)));
-    mm_base_modem_at_command (ctx->modem,
-                              cmd,
-                              3,
-                              FALSE,
-                              (GAsyncReadyCallback)call_start_ready,
-                              ctx);
-    g_free (cmd);
+    /* Chain up parent's dial sequence */
+    MM_BASE_CALL_CLASS (mm_call_huawei_parent_class)->start (
+        MM_BASE_CALL (self),
+        (GAsyncReadyCallback)parent_call_start_ready,
+        ctx);
 }
 
 /*****************************************************************************/
