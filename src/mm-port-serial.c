@@ -77,6 +77,7 @@ static guint signals[LAST_SIGNAL] = { 0 };
 struct _MMPortSerialPrivate {
     guint32 open_count;
     gboolean forced_close;
+    gboolean blocked;
     int fd;
     GHashTable *reply_cache;
     GQueue *queue;
@@ -1150,6 +1151,15 @@ mm_port_serial_open (MMPortSerial *self, GError **error)
         return FALSE;
     }
 
+    if (self->priv->blocked) {
+        g_set_error (error,
+                     MM_SERIAL_ERROR,
+                     MM_SERIAL_ERROR_OPEN_FAILED,
+                     "Could not open serial device %s: blocked",
+                     device);
+        return FALSE;
+    }
+
     if (self->priv->open_count) {
         /* Already open */
         goto success;
@@ -1484,6 +1494,51 @@ port_serial_close_force (MMPortSerial *self)
         /* Notify about the forced close status */
         g_signal_emit (self, signals[FORCED_CLOSE], 0);
     }
+}
+
+/**
+ * mm_port_serial_set_blocked:
+ * @self: the #MMSerialPort
+ * @blocked: %TRUE to block the serial port from use, %FALSE to make it available
+ *
+ * Sets the serial port blocked or unblocked.  When a port is blocked it is
+ * not available for opening and mm_port_serial_open() will return an error.
+ * Can be used to, for example, prevent internal operations on a port that
+ * switches modes between AT/QCDM/etc and some other mode (like PCM audio) when
+ * the other mode is active and ModemManager should not interfere.
+ *
+ * Returns: %TRUE if the port is blocked, %FALSE if it may be opened.
+ */
+void
+mm_port_serial_set_blocked (MMPortSerial *self, gboolean blocked)
+{
+    g_return_if_fail (MM_IS_PORT_SERIAL (self));
+
+    if (blocked == self->priv->blocked)
+        return;
+
+    self->priv->blocked = blocked;
+    if (blocked) {
+        if (mm_port_serial_is_open (self)) {
+            mm_warn ("(%s): blocking open port!",
+                     mm_port_get_device (MM_PORT (self)));
+        }
+    }
+}
+
+/**
+ * mm_port_serial_is_blocked:
+ * @self: the #MMSerialPort
+ *
+ * Returns: %TRUE if the port is blocked, %FALSE if it may be opened.
+ */
+gboolean
+mm_port_serial_is_blocked (MMPortSerial *self)
+{
+    g_return_val_if_fail (self != NULL, TRUE);
+    g_return_val_if_fail (MM_IS_PORT_SERIAL (self), TRUE);
+
+    return !!self->priv->blocked;
 }
 
 /*****************************************************************************/

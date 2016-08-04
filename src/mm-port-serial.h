@@ -120,6 +120,11 @@ gboolean mm_port_serial_open              (MMPortSerial *self,
 
 void     mm_port_serial_close             (MMPortSerial *self);
 
+void     mm_port_serial_set_blocked       (MMPortSerial *self,
+                                           gboolean blocked);
+
+gboolean mm_port_serial_is_blocked        (MMPortSerial *self);
+
 /* Reopen(), async */
 void     mm_port_serial_reopen            (MMPortSerial *self,
                                            guint32 reopen_time,
