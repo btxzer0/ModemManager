@@ -946,23 +946,40 @@ messaging_enable_unsolicited_events (MMIfaceModemMessaging *self,
 /* Detailed registration state (CDMA interface) */
 
 typedef struct {
-    MMModemCdmaRegistrationState detailed_cdma1x_state;
-    MMModemCdmaRegistrationState detailed_evdo_state;
-} DetailedRegistrationStateResults;
+    MMModemCdmaRegistrationState cdma1x_state;
+    MMModemCdmaRegistrationState evdo_state;
+} DetailedRegistrationStateResult;
 
 typedef struct {
     MMBroadbandModem *self;
+    MMPortSerialQcdm *port;
+    gboolean close_port;
     GSimpleAsyncResult *result;
-    DetailedRegistrationStateResults state;
+    MMModemCdmaRegistrationState cdma1x_state;
+    MMModemCdmaRegistrationState evdo_state;
 } DetailedRegistrationStateContext;
 
 static void
 detailed_registration_state_context_complete_and_free (DetailedRegistrationStateContext *ctx)
 {
-    /* Always not in idle! we're passing a struct in stack as result */
-    g_simple_async_result_complete (ctx->result);
+    DetailedRegistrationStateResult *r;
+
+    /* If the detailed registration state can't be determined, the operation
+     * is always completed with the generic registration state.
+     */
+    r = g_new0 (DetailedRegistrationStateResult, 1);
+    r->cdma1x_state = ctx->cdma1x_state;
+    r->evdo_state = ctx->evdo_state;
+    g_simple_async_result_set_op_res_gpointer (ctx->result, r, g_free);
+    g_simple_async_result_complete_in_idle (ctx->result);
+
     g_object_unref (ctx->result);
     g_object_unref (ctx->self);
+    if (ctx->port) {
+        if (ctx->close_port)
+            mm_port_serial_close (MM_PORT_SERIAL (ctx->port));
+        g_object_unref (ctx->port);
+    }
     g_free (ctx);
 }
 
@@ -973,14 +990,14 @@ modem_cdma_get_detailed_registration_state_finish (MMIfaceModemCdma *self,
                                                    MMModemCdmaRegistrationState *detailed_evdo_state,
                                                    GError **error)
 {
-    DetailedRegistrationStateResults *results;
+    DetailedRegistrationStateResult *result;
 
     if (g_simple_async_result_propagate_error (G_SIMPLE_ASYNC_RESULT (res), error))
         return FALSE;
 
-    results = g_simple_async_result_get_op_res_gpointer (G_SIMPLE_ASYNC_RESULT (res));
-    *detailed_cdma1x_state = results->detailed_cdma1x_state;
-    *detailed_evdo_state = results->detailed_evdo_state;
+    result = g_simple_async_result_get_op_res_gpointer (G_SIMPLE_ASYNC_RESULT (res));
+    *detailed_cdma1x_state = result->cdma1x_state;
+    *detailed_evdo_state = result->evdo_state;
     return TRUE;
 }
 
@@ -1032,10 +1049,10 @@ parse_modem_eri (DetailedRegistrationStateContext *ctx, QcdmResult *result)
     else
         new_state = MM_MODEM_CDMA_REGISTRATION_STATE_ROAMING;
 
-    if (ctx->state.detailed_cdma1x_state != MM_MODEM_CDMA_REGISTRATION_STATE_UNKNOWN)
-        ctx->state.detailed_cdma1x_state = new_state;
-    if (ctx->state.detailed_evdo_state != MM_MODEM_CDMA_REGISTRATION_STATE_UNKNOWN)
-        ctx->state.detailed_evdo_state = new_state;
+    if (ctx->cdma1x_state != MM_MODEM_CDMA_REGISTRATION_STATE_UNKNOWN)
+        ctx->cdma1x_state = new_state;
+    if (ctx->evdo_state != MM_MODEM_CDMA_REGISTRATION_STATE_UNKNOWN)
+        ctx->evdo_state = new_state;
 }
 
 static void
@@ -1045,25 +1062,24 @@ reg_eri_6500_cb (MMPortSerialQcdm *port,
 {
     GError *error = NULL;
     GByteArray *response;
+    QcdmResult *result;
 
     response = mm_port_serial_qcdm_command_finish (port, res, &error);
     if (error) {
         /* Just ignore the error and complete with the input info */
         mm_dbg ("Couldn't run QCDM MSM6500 ERI: '%s'", error->message);
         g_error_free (error);
-    } else {
-        QcdmResult *result;
-
-        result = qcdm_cmd_nw_subsys_eri_result ((const gchar *) response->data, response->len, NULL);
-        g_byte_array_unref (response);
-        if (result) {
-            parse_modem_eri (ctx, result);
-            qcdm_result_unref (result);
-        }
+        detailed_registration_state_context_complete_and_free (ctx);
+        return;
     }
 
-    /* NOTE: always complete NOT in idle here */
-    g_simple_async_result_set_op_res_gpointer (ctx->result, &ctx->state, NULL);
+    result = qcdm_cmd_nw_subsys_eri_result ((const gchar *) response->data, response->len, NULL);
+    g_byte_array_unref (response);
+    if (result) {
+        parse_modem_eri (ctx, result);
+        qcdm_result_unref (result);
+    }
+
     detailed_registration_state_context_complete_and_free (ctx);
 }
 
@@ -1074,41 +1090,40 @@ reg_eri_6800_cb (MMPortSerialQcdm *port,
 {
     GError *error = NULL;
     GByteArray *response;
+    QcdmResult *result;
 
     response = mm_port_serial_qcdm_command_finish (port, res, &error);
     if (error) {
         /* Just ignore the error and complete with the input info */
         mm_dbg ("Couldn't run QCDM MSM6800 ERI: '%s'", error->message);
         g_error_free (error);
-    } else {
-        QcdmResult *result;
-
-        /* Parse the response */
-        result = qcdm_cmd_nw_subsys_eri_result ((const gchar *) response->data, response->len, NULL);
-        g_byte_array_unref (response);
-        if (result) {
-            parse_modem_eri (ctx, result);
-            qcdm_result_unref (result);
-        } else {
-            GByteArray *nweri;
-
-            /* Try for MSM6500 */
-            nweri = g_byte_array_sized_new (25);
-            nweri->len = qcdm_cmd_nw_subsys_eri_new ((char *) nweri->data, 25, QCDM_NW_CHIPSET_6500);
-            g_assert (nweri->len);
-            mm_port_serial_qcdm_command (port,
-                                         nweri,
-                                         3,
-                                         NULL,
-                                         (GAsyncReadyCallback)reg_eri_6500_cb,
-                                         ctx);
-            g_byte_array_unref (nweri);
-            return;
-        }
+        detailed_registration_state_context_complete_and_free (ctx);
+        return;
     }
 
-    /* NOTE: always complete NOT in idle here */
-    g_simple_async_result_set_op_res_gpointer (ctx->result, &ctx->state, NULL);
+    /* Parse the response */
+    result = qcdm_cmd_nw_subsys_eri_result ((const gchar *) response->data, response->len, NULL);
+    g_byte_array_unref (response);
+    if (!result) {
+        GByteArray *nweri;
+
+        /* Try for MSM6500 */
+        nweri = g_byte_array_sized_new (25);
+        nweri->len = qcdm_cmd_nw_subsys_eri_new ((char *) nweri->data, 25, QCDM_NW_CHIPSET_6500);
+        g_assert (nweri->len);
+        mm_port_serial_qcdm_command (port,
+                                     nweri,
+                                     3,
+                                     NULL,
+                                     (GAsyncReadyCallback)reg_eri_6500_cb,
+                                     ctx);
+        g_byte_array_unref (nweri);
+        return;
+    }
+
+    /* Success */
+    parse_modem_eri (ctx, result);
+    qcdm_result_unref (result);
     detailed_registration_state_context_complete_and_free (ctx);
 }
 
@@ -1121,7 +1136,7 @@ modem_cdma_get_detailed_registration_state (MMIfaceModemCdma *self,
 {
     DetailedRegistrationStateContext *ctx;
     GByteArray *nweri;
-    MMPortSerialQcdm *port;
+    GError *error = NULL;
 
     /* Setup context */
     ctx = g_new0 (DetailedRegistrationStateContext, 1);
@@ -1130,16 +1145,32 @@ modem_cdma_get_detailed_registration_state (MMIfaceModemCdma *self,
                                              callback,
                                              user_data,
                                              modem_cdma_get_detailed_registration_state);
-    ctx->state.detailed_cdma1x_state = cdma1x_state;
-    ctx->state.detailed_evdo_state = evdo_state;
+    ctx->cdma1x_state = cdma1x_state;
+    ctx->evdo_state = evdo_state;
 
-    port = mm_base_modem_peek_port_qcdm (MM_BASE_MODEM (self));
+    ctx->port = mm_base_modem_get_port_qcdm (MM_BASE_MODEM (self));
+    if (!ctx->port) {
+        /* Ignore errors and use non-detailed registration state */
+        mm_dbg ("No available QCDM port.");
+        detailed_registration_state_context_complete_and_free (ctx);
+        return;
+    }
+
+    if (!mm_port_serial_open (MM_PORT_SERIAL (ctx->port), &error)) {
+        /* Ignore errors and use non-detailed registration state */
+        mm_dbg ("Couldn't open QCDM port: %s", error->message);
+        g_error_free (error);
+        detailed_registration_state_context_complete_and_free (ctx);
+        return;
+    }
+
+    ctx->close_port = TRUE;
 
     /* Try MSM6800 first since newer cards use that */
     nweri = g_byte_array_sized_new (25);
     nweri->len = qcdm_cmd_nw_subsys_eri_new ((char *) nweri->data, 25, QCDM_NW_CHIPSET_6800);
     g_assert (nweri->len);
-    mm_port_serial_qcdm_command (port,
+    mm_port_serial_qcdm_command (ctx->port,
                                  nweri,
                                  3,
                                  NULL,
